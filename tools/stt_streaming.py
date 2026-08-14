@@ -35,6 +35,13 @@ _AUDIO_SEND_BATCH_SIZE = 16
 # leaves room for the next utterance below the shortest observed limit while
 # still reusing each physical connection across several turns.
 _ELEVENLABS_SESSION_RECYCLE_SECONDS = 60.0
+# Semantic VAD measured a large latency win on OpenAI's own Realtime endpoint,
+# so it stays the default. OpenAI-compatible endpoints that front a different
+# transcriber (a router in front of Deepgram, say) may reject it outright, which
+# is what the one-shot fallback below is for.
+_TURN_DETECTION_MODES = ("semantic_vad", "server_vad", "manual")
+_DEFAULT_TURN_DETECTION = "semantic_vad"
+_TURN_DETECTION_FALLBACK = "server_vad"
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,70 @@ def _websocket_endpoint(base_url: str, endpoint: str) -> str:
     if not path.endswith(endpoint_path):
         path = f"{path}{endpoint_path}"
     return urlunsplit((scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def _websocket_scheme_url(base_url: str) -> Optional[str]:
+    """Rewrite only the scheme of ``base_url`` for WebSocket use.
+
+    Unlike ``_websocket_endpoint`` this appends nothing: the OpenAI SDK adds its
+    own ``/realtime`` suffix to ``websocket_base_url``, so appending here would
+    produce ``/realtime/realtime``. ``None`` means "no configured endpoint" and
+    leaves the SDK on its own api.openai.com default rather than fabricating a
+    URL for it.
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return None
+    parsed = urlsplit(base)
+    scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme, parsed.scheme)
+    return urlunsplit((scheme, parsed.netloc, parsed.path, parsed.query, ""))
+
+
+def _normalize_turn_detection(value: Any) -> str:
+    """Normalize ``stt.openai.turn_detection`` to a supported mode."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return _DEFAULT_TURN_DETECTION
+        if normalized in _TURN_DETECTION_MODES:
+            return normalized
+        logger.warning(
+            "Unknown stt.openai.turn_detection %r — defaulting to %r. "
+            "Valid values: %s",
+            value,
+            _DEFAULT_TURN_DETECTION,
+            ", ".join(_TURN_DETECTION_MODES),
+        )
+    return _DEFAULT_TURN_DETECTION
+
+
+def _turn_detection_payload(mode: str) -> Optional[Dict[str, Any]]:
+    """Render a turn-detection mode as the OpenAI Realtime wire value."""
+    if mode == "semantic_vad":
+        return {"type": "semantic_vad", "eagerness": "auto"}
+    if mode == "server_vad":
+        return {"type": "server_vad"}
+    # "manual" — explicit null disables server-side endpointing, leaving the
+    # commit boundary to Hermes' own push-to-talk/max-duration commit.
+    return None
+
+
+def _is_semantic_turn_detection_rejection(code: Any, message: str) -> bool:
+    """Whether a session-setup error means "semantic VAD is unavailable here".
+
+    Deliberately narrow: an unrelated failure (auth, quota, unknown model,
+    network) must keep propagating instead of triggering a silent retry.
+    """
+    text = (message or "").lower()
+    if "semantic" not in text:
+        return False
+    return str(code or "") == "unsupported_stt_option" or (
+        "unsupported" in text or "not supported" in text
+    )
+
+
+class _SemanticTurnDetectionUnsupported(RuntimeError):
+    """Internal signal that setup failed only because of semantic VAD."""
 
 
 def _with_query(url: str, params: Dict[str, Any]) -> str:
@@ -226,11 +297,16 @@ class OpenAIStreamingSTTProvider(StreamingSTTProvider):
         base_url: str,
         model: str,
         language: str,
+        turn_detection: Any = _DEFAULT_TURN_DETECTION,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.language = language
+        self.turn_detection = _normalize_turn_detection(turn_detection)
+        # Flipped once an endpoint rejects semantic VAD, so the remaining turns
+        # of this provider's lifetime skip the attempt we already know fails.
+        self._semantic_turn_detection_supported = True
 
     @property
     def configuration_key(self) -> tuple[Any, ...]:
@@ -240,18 +316,46 @@ class OpenAIStreamingSTTProvider(StreamingSTTProvider):
             self.base_url,
             self.model,
             self.language,
+            self.turn_detection,
         )
 
     async def open_session(self) -> StreamingSTTSession:
+        mode = self.turn_detection
+        if mode == "semantic_vad" and not self._semantic_turn_detection_supported:
+            mode = _TURN_DETECTION_FALLBACK
+        try:
+            return await self._open_session(mode)
+        except _SemanticTurnDetectionUnsupported as exc:
+            # The endpoint closes the connection on this error, so the retry
+            # needs a fresh client rather than another session.update.
+            self._semantic_turn_detection_supported = False
+            logger.info(
+                "OpenAI Realtime endpoint rejected semantic turn detection "
+                "(%s); retrying this and later sessions with %s",
+                exc,
+                _TURN_DETECTION_FALLBACK,
+            )
+            return await self._open_session(_TURN_DETECTION_FALLBACK)
+
+    async def _open_session(self, turn_detection: str) -> StreamingSTTSession:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url or None,
+            # The SDK forces wss:// when this is unset, which hangs the opening
+            # handshake against a plaintext OpenAI-compatible endpoint.
+            websocket_base_url=_websocket_scheme_url(self.base_url),
         )
+        # OpenAI-compatible routers resolve the model at WebSocket upgrade time,
+        # before any session.update arrives; api.openai.com ignores the extra
+        # parameter for the transcription intent.
+        extra_query: Dict[str, Any] = {"intent": "transcription"}
+        if self.model:
+            extra_query["model"] = self.model
         try:
             connection = await client.realtime.connect(
-                extra_query={"intent": "transcription"},
+                extra_query=extra_query,
             ).enter()
         except Exception:
             await client.close()
@@ -269,10 +373,9 @@ class OpenAIStreamingSTTProvider(StreamingSTTProvider):
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 24000},
                             "transcription": transcription,
-                            "turn_detection": {
-                                "type": "semantic_vad",
-                                "eagerness": "auto",
-                            },
+                            "turn_detection": _turn_detection_payload(
+                                turn_detection
+                            ),
                         },
                     },
                 }
@@ -283,12 +386,19 @@ class OpenAIStreamingSTTProvider(StreamingSTTProvider):
                 if event_type == "session.updated":
                     return session
                 if event_type == "error":
-                    raise RuntimeError(
-                        str(
-                            event.error.message
-                            or "OpenAI Realtime session setup failed"
-                        )
+                    message = str(
+                        event.error.message
+                        or "OpenAI Realtime session setup failed"
                     )
+                    if (
+                        turn_detection == "semantic_vad"
+                        and _is_semantic_turn_detection_rejection(
+                            getattr(event.error, "code", None),
+                            message,
+                        )
+                    ):
+                        raise _SemanticTurnDetectionUnsupported(message)
+                    raise RuntimeError(message)
         except Exception:
             await session.close()
             raise
@@ -458,6 +568,7 @@ def resolve_streaming_stt_provider(
             resolved.base_url,
             resolved.streaming_model_id,
             resolved.language,
+            resolved.section.get("turn_detection"),
         )
 
     if provider_name == "elevenlabs":

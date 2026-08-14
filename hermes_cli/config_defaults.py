@@ -1534,6 +1534,11 @@ DEFAULT_CONFIG = {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
             "streaming": True,
             "streaming_model_id": "gpt-4o-mini-transcribe",
+            # Realtime endpointing: "semantic_vad" (default, lowest latency on
+            # OpenAI) | "server_vad" | "manual" (no server VAD; Hermes commits).
+            # Endpoints that reject semantic VAD fall back to server_vad
+            # automatically, so this only needs setting to pin a mode.
+            "turn_detection": "semantic_vad",
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "mistral": {

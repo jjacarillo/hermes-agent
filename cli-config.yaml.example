@@ -1203,9 +1203,16 @@ stt:
   #   language: ""             # blank = stt.language > HERMES_LOCAL_STT_LANGUAGE > auto-detect
   openai:
     base_url: ""               # optional OpenAI-compatible API base; Realtime support is required for streaming
-    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe | gpt-transcribe
+    model: "whisper-1"         # BATCH transcription only — whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe | gpt-transcribe
     streaming: true             # automatic when this is the selected provider; set false to force batch
-    streaming_model_id: "gpt-4o-mini-transcribe"  # Realtime transcription with semantic VAD
+    streaming_model_id: "gpt-4o-mini-transcribe"  # STREAMING model — `model` above is NOT used here.
+                               # Pointing base_url at a custom OpenAI-compatible router?
+                               # Set this to a model THAT router serves (it resolves the
+                               # model at WebSocket upgrade time), or the session is rejected.
+    turn_detection: "semantic_vad"  # Realtime endpointing: semantic_vad (default, lowest latency on
+                               # OpenAI) | server_vad | manual (no server VAD; Hermes commits the turn).
+                               # An endpoint that rejects semantic VAD falls back to server_vad on its
+                               # own, so set this only to pin a mode.
     language: ""               # auto-detect; set to "en", "es", "fr", etc. to force
   # elevenlabs:
   #   base_url: ""             # optional HTTP API base

@@ -26,6 +26,8 @@ from tools.stt_streaming import (
     StreamingSTTTurnController,
     StreamingTranscriptEvent,
     _PCM16StreamResampler,
+    _websocket_endpoint,
+    _websocket_scheme_url,
     resolve_streaming_stt_provider,
 )
 
@@ -377,9 +379,13 @@ class TestProviderProtocols:
             openai_client.assert_called_once_with(
                 api_key="key",
                 base_url="https://openai-compatible.example/v1",
+                websocket_base_url="wss://openai-compatible.example/v1",
             )
             client.realtime.connect.assert_called_once_with(
-                extra_query={"intent": "transcription"},
+                extra_query={
+                    "intent": "transcription",
+                    "model": "configured-model",
+                },
             )
             update = connection.session.update.await_args.kwargs["session"]
             assert update["type"] == "transcription"
@@ -597,6 +603,340 @@ class TestProviderProtocols:
             assert not elevenlabs_socket.closed
 
         asyncio.run(_test())
+
+
+class TestOpenAIRealtimeEndpoint:
+    """The SDK forces wss:// unless websocket_base_url says otherwise."""
+
+    @pytest.mark.parametrize(
+        "base_url,expected",
+        [
+            ("http://localhost:8790/oai", "ws://localhost:8790/oai"),
+            ("https://api.openai.com/v1", "wss://api.openai.com/v1"),
+            ("ws://localhost:8790/oai", "ws://localhost:8790/oai"),
+            ("wss://compatible.example/v1", "wss://compatible.example/v1"),
+            ("http://localhost:8790/oai/", "ws://localhost:8790/oai"),
+            ("  ", None),
+            ("", None),
+        ],
+    )
+    def test_scheme_is_mapped_without_appending_an_endpoint(
+        self, base_url, expected
+    ):
+        assert _websocket_scheme_url(base_url) == expected
+
+    def test_empty_base_url_keeps_the_sdk_default(self):
+        async def _test():
+            connection = _FakeOpenAIConnection([{"type": "session.updated"}])
+            provider = OpenAIStreamingSTTProvider("key", "", "model", "")
+            with patch(
+                "openai.AsyncOpenAI",
+                return_value=_FakeOpenAIClient(connection),
+            ) as openai_client:
+                await provider.open_session()
+            kwargs = openai_client.call_args.kwargs
+            assert kwargs["base_url"] is None
+            assert kwargs["websocket_base_url"] is None
+
+        asyncio.run(_test())
+
+    def test_plaintext_endpoint_reaches_the_client_as_ws(self):
+        async def _test():
+            connection = _FakeOpenAIConnection([{"type": "session.updated"}])
+            provider = OpenAIStreamingSTTProvider(
+                "key",
+                "http://localhost:8790/oai",
+                "deepgram/nova-3",
+                "",
+            )
+            with patch(
+                "openai.AsyncOpenAI",
+                return_value=_FakeOpenAIClient(connection),
+            ) as openai_client:
+                await provider.open_session()
+            assert openai_client.call_args.kwargs["websocket_base_url"] == (
+                "ws://localhost:8790/oai"
+            )
+
+        asyncio.run(_test())
+
+    def test_real_sdk_appends_exactly_one_realtime_suffix(self):
+        """The SDK owns the /realtime suffix — we must not append our own."""
+        from openai import AsyncOpenAI
+
+        base_url = "http://localhost:8790/oai"
+        client = AsyncOpenAI(
+            api_key="key",
+            base_url=base_url,
+            websocket_base_url=_websocket_scheme_url(base_url),
+        )
+        manager = client.realtime.connect(extra_query={"intent": "transcription"})
+        prepare_url = getattr(manager, "_prepare_url", None)
+        if prepare_url is None:
+            pytest.skip("openai SDK no longer exposes _prepare_url")
+        url = str(prepare_url())
+        assert url == "ws://localhost:8790/oai/realtime"
+        assert url.count("/realtime") == 1
+
+    def test_model_travels_in_the_upgrade_query(self):
+        async def _test():
+            connection = _FakeOpenAIConnection([{"type": "session.updated"}])
+            client = _FakeOpenAIClient(connection)
+            provider = OpenAIStreamingSTTProvider(
+                "key",
+                "http://localhost:8790/oai",
+                "deepgram/nova-3",
+                "",
+            )
+            with patch("openai.AsyncOpenAI", return_value=client):
+                await provider.open_session()
+            client.realtime.connect.assert_called_once_with(
+                extra_query={
+                    "intent": "transcription",
+                    "model": "deepgram/nova-3",
+                },
+            )
+            # session.update still carries the model — routers re-resolve there.
+            update = connection.session.update.await_args.kwargs["session"]
+            assert update["audio"]["input"]["transcription"]["model"] == (
+                "deepgram/nova-3"
+            )
+
+        asyncio.run(_test())
+
+    def test_empty_model_is_omitted_from_the_upgrade_query(self):
+        async def _test():
+            connection = _FakeOpenAIConnection([{"type": "session.updated"}])
+            client = _FakeOpenAIClient(connection)
+            provider = OpenAIStreamingSTTProvider("key", "", "", "")
+            with patch("openai.AsyncOpenAI", return_value=client):
+                await provider.open_session()
+            client.realtime.connect.assert_called_once_with(
+                extra_query={"intent": "transcription"},
+            )
+
+        asyncio.run(_test())
+
+    @pytest.mark.parametrize(
+        "base_url,expected",
+        [
+            ("https://compatible.example/v1", "wss://compatible.example/v1"),
+            ("http://localhost:9000", "ws://localhost:9000"),
+        ],
+    )
+    def test_elevenlabs_endpoint_helper_still_appends(self, base_url, expected):
+        assert _websocket_endpoint(base_url, "speech-to-text/realtime") == (
+            f"{expected}/speech-to-text/realtime"
+        )
+
+
+class TestOpenAITurnDetection:
+    _SEMANTIC = {"type": "semantic_vad", "eagerness": "auto"}
+
+    @staticmethod
+    def _sent_turn_detection(connection):
+        update = connection.session.update.await_args.kwargs["session"]
+        return update["audio"]["input"]["turn_detection"]
+
+    @pytest.mark.parametrize(
+        "configured,expected",
+        [
+            (None, _SEMANTIC),
+            ("semantic_vad", _SEMANTIC),
+            ("server_vad", {"type": "server_vad"}),
+            ("manual", None),
+            ("SERVER_VAD", {"type": "server_vad"}),
+            ("", _SEMANTIC),
+            ("nonsense", _SEMANTIC),
+        ],
+    )
+    def test_configured_mode_reaches_the_wire(self, configured, expected):
+        async def _test():
+            connection = _FakeOpenAIConnection([{"type": "session.updated"}])
+            provider = OpenAIStreamingSTTProvider(
+                "key",
+                "",
+                "model",
+                "",
+                configured,
+            )
+            with patch(
+                "openai.AsyncOpenAI",
+                return_value=_FakeOpenAIClient(connection),
+            ):
+                await provider.open_session()
+            assert self._sent_turn_detection(connection) == expected
+
+        asyncio.run(_test())
+
+    def test_default_stays_semantic_vad(self):
+        provider = OpenAIStreamingSTTProvider("key", "", "model", "")
+        assert provider.turn_detection == "semantic_vad"
+        assert (
+            resolve_streaming_stt_provider({
+                "provider": "openai",
+                "openai": {
+                    "api_key": "key",
+                    "streaming_model_id": "configured-model",
+                },
+            }).turn_detection
+            == "semantic_vad"
+        )
+
+    @pytest.mark.parametrize("mode", ["semantic_vad", "server_vad", "manual"])
+    def test_config_section_selects_the_mode(self, mode):
+        provider = resolve_streaming_stt_provider({
+            "provider": "openai",
+            "openai": {
+                "api_key": "key",
+                "streaming_model_id": "configured-model",
+                "turn_detection": mode,
+            },
+        })
+        assert isinstance(provider, OpenAIStreamingSTTProvider)
+        assert provider.turn_detection == mode
+        assert mode in provider.configuration_key
+
+    def test_semantic_rejection_falls_back_and_is_remembered(self):
+        async def _test():
+            rejected = _FakeOpenAIConnection([
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "unsupported_stt_option",
+                        "message": (
+                            "semantic turn detection is not supported by the "
+                            "selected streaming model"
+                        ),
+                    },
+                }
+            ])
+            accepted = _FakeOpenAIConnection([{"type": "session.updated"}])
+            reused = _FakeOpenAIConnection([{"type": "session.updated"}])
+            clients = [
+                _FakeOpenAIClient(rejected),
+                _FakeOpenAIClient(accepted),
+                _FakeOpenAIClient(reused),
+            ]
+            provider = OpenAIStreamingSTTProvider(
+                "key",
+                "http://localhost:8790/oai",
+                "deepgram/nova-3",
+                "",
+            )
+            with patch("openai.AsyncOpenAI", side_effect=clients) as openai_client:
+                first = await provider.open_session()
+                second = await provider.open_session()
+
+            assert isinstance(first, OpenAIStreamingSTTSession)
+            assert isinstance(second, OpenAIStreamingSTTSession)
+            # The endpoint closes the socket, so each attempt needs its own
+            # client; the second turn skips the doomed semantic attempt.
+            assert openai_client.call_count == 3
+            assert self._sent_turn_detection(rejected) == self._SEMANTIC
+            assert self._sent_turn_detection(accepted) == {"type": "server_vad"}
+            assert self._sent_turn_detection(reused) == {"type": "server_vad"}
+            clients[0].close.assert_awaited_once_with()
+
+        asyncio.run(_test())
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            {
+                "code": "invalid_model",
+                "message": "No provider supports the requested model.",
+            },
+            {"code": "invalid_api_key", "message": "Invalid API key."},
+            {
+                "code": "unsupported_stt_option",
+                "message": "diarization is not supported by this model",
+            },
+            {"message": "Insufficient credits."},
+        ],
+    )
+    def test_unrelated_setup_errors_still_propagate(self, error):
+        async def _test():
+            connection = _FakeOpenAIConnection([{"type": "error", "error": error}])
+            client = _FakeOpenAIClient(connection)
+            provider = OpenAIStreamingSTTProvider(
+                "key",
+                "http://localhost:8790/oai",
+                "deepgram/nova-3",
+                "",
+            )
+            with patch("openai.AsyncOpenAI", return_value=client) as openai_client:
+                with pytest.raises(RuntimeError, match=error["message"][:12]):
+                    await provider.open_session()
+            assert openai_client.call_count == 1
+
+            # The failure must not have poisoned the configured mode.
+            retry = _FakeOpenAIConnection([{"type": "session.updated"}])
+            with patch(
+                "openai.AsyncOpenAI",
+                return_value=_FakeOpenAIClient(retry),
+            ):
+                await provider.open_session()
+            assert self._sent_turn_detection(retry) == self._SEMANTIC
+
+        asyncio.run(_test())
+
+    def test_non_semantic_modes_never_trigger_the_fallback(self):
+        async def _test():
+            connection = _FakeOpenAIConnection([
+                {
+                    "type": "error",
+                    "error": {
+                        "code": "unsupported_stt_option",
+                        "message": "semantic turn detection is not supported",
+                    },
+                }
+            ])
+            provider = OpenAIStreamingSTTProvider(
+                "key",
+                "http://localhost:8790/oai",
+                "deepgram/nova-3",
+                "",
+                "server_vad",
+            )
+            with patch(
+                "openai.AsyncOpenAI",
+                return_value=_FakeOpenAIClient(connection),
+            ) as openai_client:
+                with pytest.raises(RuntimeError, match="semantic turn detection"):
+                    await provider.open_session()
+            assert openai_client.call_count == 1
+
+        asyncio.run(_test())
+
+    def test_elevenlabs_session_setup_is_unaffected(self, provider_wire_events):
+        async def _test():
+            websocket = _FakeWebSocket(provider_wire_events["elevenlabs"])
+            provider = ElevenLabsStreamingSTTProvider(
+                "key",
+                "https://elevenlabs-compatible.example/v1",
+                {"streaming_model_id": "configured-model"},
+                "",
+            )
+            with (
+                patch(
+                    "tools.stt_streaming._connect",
+                    AsyncMock(return_value=websocket),
+                ) as connect,
+                patch("openai.AsyncOpenAI") as openai_client,
+            ):
+                session = await provider.open_session()
+            assert isinstance(session, ElevenLabsStreamingSTTSession)
+            openai_client.assert_not_called()
+            url = urlsplit(connect.await_args.args[0])
+            assert (url.scheme, url.path) == (
+                "wss",
+                "/v1/speech-to-text/realtime",
+            )
+            assert "turn_detection" not in url.query
+
+        asyncio.run(_test())
+
 
 class _CoordinatorSession(StreamingSTTSession):
     sample_rate = 16000
